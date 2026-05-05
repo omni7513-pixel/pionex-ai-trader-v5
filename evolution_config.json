@@ -1,0 +1,16 @@
+{
+    "strategy_params": {
+        "rsi_buy_threshold": 45,
+        "rsi_sell_threshold": 75,
+        "bb_std_dev": 1.5,
+        "base_position_weight": 0.3
+    },
+    "learning_notes": [
+        "Initial configuration for v2.2 aggressive mode.",
+        "Reflected on 2026-05-02 11:26:21.577823: Lowered RSI threshold due to false breakout.",
+        "2026-05-02 13:53:03.667956: \u56e0\u8667\u640d\u8abf\u6574 RSI \u81f3 20",
+        "2026-05-02 13:56:21.011894: \u56e0\u8667\u640d\u512a\u5316\u53c3\u6578\u81f3 20",
+        "2026-05-04 03:02:34.347661: \u56e0\u8667\u640d\u512a\u5316\u53c3\u6578\u81f3 45"
+    ],
+    "last_reflection_date": "2026-05-02"
+}
