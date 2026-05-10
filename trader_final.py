@@ -76,7 +76,7 @@ class FinalAITrader:
 
     def _load_config(self) -> dict:
         default = {
-            "rsi_buy":  25,
+            "rsi_buy":  50,
             "rsi_sell": 75,
             "bb_std":   1.5,
             "learning_history": []
@@ -232,10 +232,10 @@ class FinalAITrader:
 
         if (
             crossroad_ok                          # 過馬路理論：位置+狀態雙確認
-            and rsi < self.config["rsi_buy"]      # RSI 超賣
+            and rsi < self.config["rsi_buy"]      # RSI 低於 50（未超買）
             and price <= bb_low                   # 布林下軌
-            and self.market_score > 0.1           # 美股情緒正面
             and rr_ok
+            # 情緒分數限制已移除，不再需要美股正面情緒
         ):
             action = "BUY"
         elif (
