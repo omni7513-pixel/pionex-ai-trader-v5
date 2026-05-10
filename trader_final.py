@@ -233,9 +233,8 @@ class FinalAITrader:
         if (
             crossroad_ok                          # 過馬路理論：位置+狀態雙確認
             and rsi < self.config["rsi_buy"]      # RSI 低於 50（未超買）
-            and price <= bb_low                   # 布林下軌
-            and rr_ok
-            # 情緒分數限制已移除，不再需要美股正面情緒
+            # 布林下軌條件已移除（1分鐘K線波動太小，下軌幾乎不可能觸及）
+            # 情緒分數限制已移除
         ):
             action = "BUY"
         elif (
