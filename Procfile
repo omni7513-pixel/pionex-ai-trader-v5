@@ -1,2 +1,2 @@
 
-worker: python trader_v5_1.py --live
+worker: python trader_final.py
