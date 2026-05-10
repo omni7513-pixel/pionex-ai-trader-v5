@@ -36,7 +36,8 @@ DAILY_TARGET_RATE = 0.10   # 每日 10% 獲利目標
 MAX_DRAWDOWN_RATE = 0.15   # 最大回撤 15% 保護
 POSITION_WEIGHT   = 0.30   # 單筆倉位 30%
 
-client = OpenAI(api_key=OPENAI_KEY)
+# 延遲初始化 OpenAI 客戶端，避免 API Key 為空時崩潰
+client = OpenAI(api_key=OPENAI_KEY) if OPENAI_KEY else None
 
 # ─── 工具函數 ────────────────────────────────────────────
 def calc_rsi(series: pd.Series, period: int = 7) -> float:
@@ -139,20 +140,24 @@ class FinalAITrader:
         # 實際可調用 Yahoo Finance API 獲取真實數據
         # 此處以 AI 推理模擬
         try:
-            resp = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{
-                    "role": "user",
-                    "content": (
-                        "請根據 2026 年 5 月當前市場環境，"
-                        "評估美股科技板塊 (QQQ/NVDA/COIN) 對加密貨幣市場的情緒影響，"
-                        "給出 -1.0 到 1.0 的分數，只回傳數字。"
-                    )
-                }],
-                max_tokens=10
-            )
-            raw = resp.choices[0].message.content.strip()
-            self.market_score = float("".join(c for c in raw if c in "0123456789.-"))
+            if client is None:
+                # OpenAI Key 未設定，使用預設中性情緒分數
+                self.market_score = 0.0
+            else:
+                resp = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[{
+                        "role": "user",
+                        "content": (
+                            "請根據 2026 年 5 月當前市場環境，"
+                            "評估美股科技板塊 (QQQ/NVDA/COIN) 對加密貨幣市場的情緒影響，"
+                            "給出 -1.0 到 1.0 的分數，只回傳數字。"
+                        )
+                    }],
+                    max_tokens=10
+                )
+                raw = resp.choices[0].message.content.strip()
+                self.market_score = float("".join(c for c in raw if c in "0123456789.-"))
         except Exception:
             self.market_score = 0.0
         print(f"  📊 情緒分數: {self.market_score:+.2f}")
