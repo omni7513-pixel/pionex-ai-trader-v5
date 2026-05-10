@@ -320,7 +320,7 @@ class FinalAITrader:
             # 6. 自主學習反思
             self.reflect_and_evolve()
 
-            await asyncio.sleep(60)
+            await asyncio.sleep(600)  # 每 10 分鐘掃描一次
 
         if self.session:
             await self.session.close()
