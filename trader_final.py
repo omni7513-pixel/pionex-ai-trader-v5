@@ -59,7 +59,12 @@ def calc_ema(series: pd.Series, span: int = 200) -> float:
 
 # ─── 主交易員 ────────────────────────────────────────────
 class FinalAITrader:
-    def __init__(self, config_path: str = "evolution_config.json"):
+    def __init__(self, config_path: str = None):
+        # 使用環境變數指定的資料目錄，預設為 /data（持久化 Volume）
+        data_dir = os.getenv("DATA_DIR", "/data")
+        os.makedirs(data_dir, exist_ok=True)
+        if config_path is None:
+            config_path = os.path.join(data_dir, "evolution_config.json")
         self.config_path    = config_path
         self.config         = self._load_config()
         self.start_equity   = 0.0
