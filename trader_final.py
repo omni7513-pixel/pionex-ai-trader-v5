@@ -91,28 +91,37 @@ class FinalAITrader:
 
     # ── 簽名 ──────────────────────────────────────────────
     def _sign(self, method: str, path: str, params: dict = None, body: dict = None):
-        ts  = str(int(time.time() * 1000))
-        qs  = "&".join(f"{k}={v}" for k, v in sorted((params or {}).items()))
-        bs  = json.dumps(body) if body else ""
-        msg = f"{method.upper()}{path}{'?' if qs else ''}{qs}{bs}{ts}"
-        sig = hmac.new(API_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
-        return sig, ts
+        """
+        Pionex 正確簽名方式（參考官方文檔）：
+        1. timestamp 放入 params 中
+        2. 按 ASCII 升序排序所有 params（含 timestamp）
+        3. 拼接 METHOD + PATH?sorted_params
+        4. HMAC SHA256 簽名
+        """
+        ts = str(int(time.time() * 1000))
+        p  = dict(params or {})
+        p["timestamp"] = ts
+        sorted_qs = "&".join(f"{k}={v}" for k, v in sorted(p.items()))
+        sign_str  = f"{method.upper()}{path}?{sorted_qs}"
+        sig = hmac.new(API_SECRET.encode("utf-8"), sign_str.encode("utf-8"), hashlib.sha256).hexdigest()
+        return sorted_qs, sig
 
     # ── HTTP 請求 ─────────────────────────────────────────
     async def _request(self, method: str, path: str, params: dict = None, body: dict = None):
         if not self.session:
             self.session = aiohttp.ClientSession()
-        sig, ts = self._sign(method, path, params, body)
+        sorted_qs, sig = self._sign(method, path, params, body)
         headers = {
             "PIONEX-KEY":       API_KEY,
             "PIONEX-SIGNATURE": sig,
-            "PIONEX-TIMESTAMP": ts,
             "Content-Type":     "application/json"
         }
         try:
+            # 使用已排序含 timestamp 的 query string
+            url = f"{BASE_URL}{path}?{sorted_qs}"
             async with self.session.request(
-                method, f"{BASE_URL}{path}",
-                params=params, json=body, headers=headers, timeout=aiohttp.ClientTimeout(total=10)
+                method, url,
+                json=body, headers=headers, timeout=aiohttp.ClientTimeout(total=10)
             ) as resp:
                 return await resp.json(content_type=None)
         except Exception as e:
