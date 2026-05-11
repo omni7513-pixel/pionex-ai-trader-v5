@@ -80,9 +80,12 @@ OPENAI_KEY = os.getenv("OPENAI_API_KEY", "")
 BASE_URL   = "https://api.pionex.com"
 
 SYMBOLS           = ["BTC_USDT", "ETH_USDT", "SOL_USDT", "ADA_USDT", "BNB_USDT", "XRP_USDT", "NVDAX_USDT"]
+FUTURES_SYMBOLS   = ["BTC_USDT_PERP", "ETH_USDT_PERP", "SOL_USDT_PERP"]  # 合約幣種
 DAILY_TARGET_RATE = 0.10   # 每日 10% 獲利目標
 MAX_DRAWDOWN_RATE = 0.15   # 最大回撤 15% 保護
-POSITION_WEIGHT   = 0.50   # 單筆倉位 50%
+POSITION_WEIGHT   = 0.60   # 現貨單筆倉位 60%（本金 6:4 分配，現貨佔 60%）
+FUTURES_WEIGHT    = 0.40   # 合約資金佔比 40%（本金 6:4 分配，合約佔 40%）
+MAX_LEVERAGE      = 20     # 最高槓桿倍數（影片三建議上限）
 TAKE_PROFIT_RATE  = 0.03   # 停利 +3%
 STOP_LOSS_RATE    = 0.02   # 停損 -2%
 
@@ -456,12 +459,181 @@ class FinalAITrader:
                 self._save_config()
 
     # ── 主迴圈 ────────────────────────────────────────────
+
+    # ════════════════════════════════════════════════════════════
+    # 🔥 合約槓桿模組（本金 40%，自動判斷槓桿倍數）
+    # 策略來源：阿儒阿育交易室 awEB-UO13PA（W型態做多）
+    # ════════════════════════════════════════════════════════════
+
+    def _calc_leverage(self, rsi: float, w_pattern: bool, market_score: float) -> int:
+        """
+        自動判斷槓桿倍數（最高 20x，最低 3x）
+        邏輯：
+          - 基礎槓桿 5x
+          - W型態出現：+5x（強訊號加碼）
+          - RSI < 35（超賣）：+3x
+          - RSI < 45：+2x
+          - 市場情緒 > 0.5（美股強勢）：+2x
+          - 市場情緒 < -0.3（美股弱勢）：-3x（降槓桿）
+          - 上限 20x，下限 3x
+        """
+        lev = 5
+        if w_pattern:
+            lev += 5
+        if rsi < 35:
+            lev += 3
+        elif rsi < 45:
+            lev += 2
+        if market_score > 0.5:
+            lev += 2
+        elif market_score < -0.3:
+            lev -= 3
+        return max(3, min(MAX_LEVERAGE, lev))
+
+    async def _set_futures_leverage(self, symbol: str, leverage: int) -> bool:
+        """設定合約槓桿倍數"""
+        try:
+            body = {"symbol": symbol, "leverage": str(leverage)}
+            resp = await self._request("POST", "/uapi/v1/account/leverage", body=body)
+            return resp.get("result", False)
+        except Exception as e:
+            print(f"  ⚠️ 設定槓桿失敗 [{symbol}]: {e}")
+            return False
+
+    async def _get_futures_balance(self) -> float:
+        """取得合約帳戶 USDT 餘額"""
+        try:
+            resp = await self._request("GET", "/uapi/v1/account/balances")
+            balances = resp.get("data", {}).get("balances", [])
+            for b in balances:
+                if b.get("coin") == "USDT":
+                    return float(b.get("free", 0))
+        except Exception:
+            pass
+        return 0.0
+
+    async def _get_futures_positions(self) -> list:
+        """取得目前合約持倉"""
+        try:
+            resp = await self._request("GET", "/uapi/v1/account/positions")
+            return resp.get("data", {}).get("positions", [])
+        except Exception:
+            return []
+
+    async def _place_futures_order(self, symbol: str, side: str, size: float, price: float) -> bool:
+        """下合約市價單（MARKET_QTY）"""
+        try:
+            body = {
+                "symbol": symbol,
+                "side": side,          # "BUY" or "SELL"
+                "type": "MARKET_QTY",
+                "size": f"{size:.6f}",
+                "reduceOnly": False
+            }
+            resp = await self._request("POST", "/uapi/v1/trade/order", body=body)
+            if resp.get("result"):
+                order_id = resp.get("data", {}).get("orderId", "?")
+                print(f"  ✅ 合約{side}成功 [{symbol}] size={size:.6f} | OrderID={order_id}")
+                return True
+            else:
+                print(f"  ❌ 合約{side}失敗 [{symbol}]: {resp}")
+                return False
+        except Exception as e:
+            print(f"  ❌ 合約下單異常 [{symbol}]: {e}")
+            return False
+
+    async def analyze_and_trade_futures(self, symbol: str, futures_budget: float):
+        """
+        合約槓桿交易主函數
+        - symbol: 合約幣種（如 BTC_USDT_PERP）
+        - futures_budget: 分配給合約的 USDT 預算
+        策略：W型態 + 過馬路 + 自動槓桿
+        """
+        # 取得對應現貨 K 線（合約用現貨價格分析）
+        spot_symbol = symbol.replace("_PERP", "")
+        try:
+            df = await self.get_klines(spot_symbol, interval="5m", limit=200)
+        except Exception as e:
+            print(f"  ⚠️ 合約 [{symbol}] 取得K線失敗: {e}")
+            return
+
+        price  = float(df["close"].iloc[-1])
+        rsi    = calc_rsi(df["close"], 7)
+        crossroad_ok, crossroad_reason = self._crossroad_filter(df)
+        w_pattern, w_reason = self._detect_w_pattern(df)
+        support_bounce = self._check_support_bounce(df)
+
+        # 計算自動槓桿倍數
+        leverage = self._calc_leverage(rsi, w_pattern, self.market_score)
+
+        # 檢查現有合約持倉
+        pos_key = f"FUTURES_{symbol}"
+        if pos_key in self.positions:
+            pos = self.positions[pos_key]
+            entry = pos["entry_price"]
+            pnl_rate = (price - entry) / entry
+            print(f"  📊 合約持倉 [{symbol}] 入場={entry:.2f} 現價={price:.2f} PnL={pnl_rate*100:.1f}% (槓桿{pos['leverage']}x)")
+            # 停利：+3%（實際獲利 = pnl_rate × leverage）
+            if pnl_rate >= TAKE_PROFIT_RATE:
+                print(f"  🎯 合約停利！PnL={pnl_rate*100:.1f}% 槓桿{pos['leverage']}x → 實際{pnl_rate*pos['leverage']*100:.1f}%，平倉")
+                size = pos.get("size", 0)
+                if size > 0:
+                    success = await self._place_futures_order(symbol, "SELL", size, price)
+                    if success:
+                        del self.positions[pos_key]
+                return
+            # 停損：-2%
+            elif pnl_rate <= -STOP_LOSS_RATE:
+                print(f"  🛑 合約停損！PnL={pnl_rate*100:.1f}%，平倉")
+                size = pos.get("size", 0)
+                if size > 0:
+                    success = await self._place_futures_order(symbol, "SELL", size, price)
+                    if success:
+                        del self.positions[pos_key]
+                return
+
+        # 進場條件：過馬路 + (W型態 OR 支撐反彈) + RSI 未超買
+        rsi_threshold = 55 if (w_pattern or support_bounce) else 45
+        should_enter = (
+            crossroad_ok
+            and rsi < rsi_threshold
+            and pos_key not in self.positions
+        )
+
+        emoji = "🟢" if should_enter else "⚪"
+        print(
+            f"  {emoji} 合約 [{symbol}] {('BUY' if should_enter else 'HOLD')} | "
+            f"Price={price:.2f} | RSI={rsi:.1f} | 槓桿={leverage}x | "
+            f"W={'✅' if w_pattern else '❌'} | 支撐反彈={'✅' if support_bounce else '❌'}"
+        )
+        print(f"     └ 過馬路: {crossroad_reason}")
+
+        if should_enter:
+            # 計算倉位大小：預算 × 槓桿 / 價格 = 合約數量
+            margin = futures_budget * (1 / len(FUTURES_SYMBOLS))  # 平均分配給每個合約幣種
+            if margin < 1.0:
+                print(f"  ⚠️ 合約 [{symbol}] 保證金不足（{margin:.2f} USDT）")
+                return
+            contract_size = (margin * leverage) / price
+            # 設定槓桿
+            await self._set_futures_leverage(symbol, leverage)
+            # 下單
+            success = await self._place_futures_order(symbol, "BUY", contract_size, price)
+            if success:
+                self.positions[pos_key] = {
+                    "entry_price": price,
+                    "size": contract_size,
+                    "leverage": leverage,
+                    "margin": margin
+                }
+                print(f"     └ 合約開倉: 保證金={margin:.2f} USDT | 槓桿={leverage}x | 合約量={contract_size:.6f}")
+
     async def run(self):
         print("=" * 60)
         print("🚀 Pionex AI Trader - 終極整合版 啟動")
-        print(f"   監控幣種: {', '.join(SYMBOLS)}")
-        print(f"   每日目標: {DAILY_TARGET_RATE*100:.0f}%")
-        print(f"   停利: +{TAKE_PROFIT_RATE*100:.0f}% | 停損: -{STOP_LOSS_RATE*100:.0f}%")
+        print(f"   現貨幣種 (60%): {', '.join(SYMBOLS)}")
+        print(f"   合約幣種 (40%): {', '.join(FUTURES_SYMBOLS)} | 最高槓桿: {MAX_LEVERAGE}x")
+        print(f"   每日目標: {DAILY_TARGET_RATE*100:.0f}% | 停利: +{TAKE_PROFIT_RATE*100:.0f}% | 停損: -{STOP_LOSS_RATE*100:.0f}%")
         print("=" * 60)
 
         cycle = 0
@@ -490,8 +662,12 @@ class FinalAITrader:
             # 4. 跨市場情緒掃描
             await self.scan_market_sentiment()
 
-            # 5. 多幣種並行分析與交易
-            await asyncio.gather(*[self.analyze_and_trade(s) for s in SYMBOLS])
+            # 5. 多幣種並行分析與交易（現貨 60% + 合約 40%）
+            # 計算合約預算（總資產的 40%）
+            futures_budget = self.current_equity * FUTURES_WEIGHT
+            spot_tasks = [self.analyze_and_trade(s) for s in SYMBOLS]
+            futures_tasks = [self.analyze_and_trade_futures(s, futures_budget) for s in FUTURES_SYMBOLS]
+            await asyncio.gather(*(spot_tasks + futures_tasks))
 
             # 6. 自主學習反思
             self.reflect_and_evolve()
