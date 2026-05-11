@@ -206,6 +206,21 @@ class FinalAITrader:
             self.current_equity = usdt
             if self.start_equity == 0:
                 self.start_equity = usdt
+            # ── 從帳戶餘額同步持倉（防止重啟後 positions 清空導致重複買入）──
+            # 只同步 SYMBOLS 中的幣種，避免誤算網格機器人持倉
+            for sym in SYMBOLS:
+                coin = sym.replace("_USDT", "")  # "BTC_USDT" → "BTC"
+                if coin in ("USDT", "NVDAX"):     # 跳過 USDT 本身和美股代幣
+                    continue
+                bal = self._balances.get(coin)
+                if bal:
+                    qty = float(bal.get("free", 0)) + float(bal.get("frozen", 0))
+                    if qty > 0.000001 and sym not in self.positions:
+                        # 重啟後恢復持倉記錄（entry_price=0 代表未知）
+                        self.positions[sym] = {"entry_price": 0.0, "qty": qty}
+                    elif qty <= 0.000001 and sym in self.positions:
+                        # 帳戶已無此幣，清除記錄（可能被手動賣出）
+                        del self.positions[sym]
         profit = self.current_equity - self.start_equity
         return profit
 
@@ -409,7 +424,11 @@ class FinalAITrader:
         if symbol in self.positions:
             pos = self.positions[symbol]
             entry = pos["entry_price"]
-            pnl_rate = (price - entry) / entry
+            if entry == 0.0:
+                # 重啟後恢復的持倉，entry_price 未知，跳過停利/停損計算
+                pnl_rate = 0.0
+            else:
+                pnl_rate = (price - entry) / entry
             if pnl_rate >= TAKE_PROFIT_RATE:
                 print(f"  🎯 [{symbol}] 停利觸發！獲利 {pnl_rate*100:.1f}%，賣出")
                 success = await self.place_order(symbol, "SELL", 0, price)
