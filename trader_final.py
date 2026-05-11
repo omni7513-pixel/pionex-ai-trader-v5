@@ -13,6 +13,54 @@ Karpathy Explicit Assumptions:
      並在達成每日 10% 獲利目標時自動鎖定利潤停止交易。
 """
 
+
+# ═══════════════════════════════════════════════════════════════
+# 📚 策略知識庫 - 來源：阿儒阿育的交易室 YouTube 教學（2025）
+# ═══════════════════════════════════════════════════════════════
+#
+# 【影片一】手動型態交易策略（g838P1EZfQY）
+#   核心：找「轉折低點」支撐區間進場，等待 W 型態確認
+#   進場條件：
+#     1. 價格必須「戳破」支撐區間後再彈回（能起死回生的區間）
+#     2. 第三次反彈高度必須超過第二次（越彈越有力）
+#   停利：放在前次反彈的「前高」
+#   停損：放在進場前幾次反彈的「最低點」
+#   適用：任何幣種、任何時間週期、任何市場方向
+#
+# 【影片二】Pionex 合約網格機器人（7j0uHMCr9a4）
+#   類型：合約網格，選「做多」或「做空」，不選「中性」
+#   等差 vs 等比：直接選等差即可
+#   範圍設定：
+#     下限 = 圖表上前一個明顯低點（保守可抓更前一個）
+#     上限 = 目前圖表最高點
+#   格數：調整到每格利潤率落在 0.1%~0.5% 之間
+#   資金：每個機器人不超過總本金的 5%
+#   槓桿：可用槓桿降低門檻，但強平價必須在止損價外面
+#   止盈：設在網格上限（突破上限自動關閉）
+#   止損：設在網格下限外一點點（例如下限 0.1 → 止損 0.099）
+#   挑幣：做多選漲幅排行榜前段、階梯式穩定上漲的幣
+#   注意：強平價絕對不能落在網格範圍內
+#
+# 【影片三】合約槓桿做多策略（awEB-UO13PA）
+#   核心：找「W（雙底）型態」進場做多
+#   槓桿：最多 20 倍以內，新手不超過此限制
+#   保證金模式：必須用「逐倉」，絕對不用「全倉」
+#   進場：W 型態完整出現後，用市價單進場
+#   時間週期：1小時線找不到就換 5 分鐘線
+#   停利：W 型態高度 × 1 倍往上（1:1 盈虧比）
+#   停損：W 型態最底部下方一點點（避開市場雜訊）
+#   幣種：永續合約區任何幣種，找到 W 就進場
+#   口訣：「出現W = 價格會上漲」（如同喝大冰奶必拉肚子）
+#   風控：虧了要檢討，找出止損太近/太晚進場/W判斷錯誤等原因
+#
+# 【策略整合應用原則】
+#   1. W型態偵測：連續低點中第三個低點高於第二個低點 → 做多訊號加分
+#   2. 支撐區間確認：價格戳破支撐後反彈 → 進場可信度提升
+#   3. 合約網格：震盪行情中，每格利潤目標 0.1%~0.5%
+#   4. 資金控管：單筆不超過總資金 5%（現貨可放寬至 50%）
+#   5. 槓桿上限：20 倍，逐倉模式，強平價必須在止損外
+# ═══════════════════════════════════════════════════════════════
+
 import os
 import json
 import time
@@ -246,6 +294,47 @@ class FinalAITrader:
         c3_low  = float(df["low"].iloc[-1])
         return c3_low > c1_high
 
+
+    # ── W 型態偵測（影片三策略）────────────────────────────
+    def _detect_w_pattern(self, df: pd.DataFrame) -> tuple[bool, str]:
+        """
+        偵測 W（雙底）型態：
+        - 找最近 20 根 K 線內的三個連續低點
+        - 條件：第三個低點 > 第二個低點（越彈越有力）
+        - 來源：阿儒阿育交易室 awEB-UO13PA
+        """
+        if len(df) < 20:
+            return False, "資料不足"
+        lows = df["low"].iloc[-20:].values
+        # 找局部低點（比左右兩根都低）
+        local_lows = []
+        for i in range(1, len(lows) - 1):
+            if lows[i] < lows[i-1] and lows[i] < lows[i+1]:
+                local_lows.append((i, lows[i]))
+        if len(local_lows) < 3:
+            return False, f"局部低點不足（找到{len(local_lows)}個）"
+        # 取最近三個低點
+        p1, p2, p3 = local_lows[-3], local_lows[-2], local_lows[-1]
+        # W 條件：第三個低點高於第二個低點（越彈越有力）
+        w_ok = p3[1] > p2[1]
+        reason = f"低點序列: {p1[1]:.2f}→{p2[1]:.2f}→{p3[1]:.2f} {'✅W型態' if w_ok else '❌非W'}"
+        return w_ok, reason
+
+    # ── 支撐區間確認（影片一策略）──────────────────────────
+    def _check_support_bounce(self, df: pd.DataFrame) -> bool:
+        """
+        確認價格是否「戳破支撐後反彈」：
+        - 近5根K線中有低於前20根最低點的情況，但收盤回到上方
+        - 來源：阿儒阿育交易室 g838P1EZfQY
+        """
+        if len(df) < 25:
+            return False
+        support = float(df["low"].iloc[-25:-5].min())
+        recent = df.iloc[-5:]
+        pierced = any(float(row["low"]) < support for _, row in recent.iterrows())
+        recovered = float(df["close"].iloc[-1]) > support
+        return pierced and recovered
+
     # ── 單幣種分析與決策 ──────────────────────────────────
     async def analyze_and_trade(self, symbol: str):
         if self.target_reached:
@@ -267,6 +356,10 @@ class FinalAITrader:
         rsi    = calc_rsi(df["close"], 7)
         bb_up, bb_mid, bb_low_val = calc_bb(df["close"], 20, self.config["bb_std"])
         fvg    = self._detect_fvg(df)
+        # W 型態偵測（影片三：合約槓桿做多策略）
+        w_pattern, w_reason = self._detect_w_pattern(df)
+        # 支撐區間確認（影片一：手動型態交易策略）
+        support_bounce = self._check_support_bounce(df)
         crossroad_ok, crossroad_reason = self._crossroad_filter(df)
 
         # ── 停利/停損檢查（已持倉時）────────────────────
@@ -290,9 +383,13 @@ class FinalAITrader:
         # ── 決策邏輯 ──────────────────────────────────────
         action = "HOLD"
 
+        # W型態或支撐反彈可降低 RSI 門檻（影片一/三策略加分）
+        rsi_threshold = self.config["rsi_buy"]
+        if w_pattern or support_bounce:
+            rsi_threshold = min(rsi_threshold + 10, 65)  # W型態出現時放寬 RSI 門檻
         if (
             crossroad_ok                          # 過馬路理論：位置+狀態雙確認
-            and rsi < self.config["rsi_buy"]      # RSI 低於 50（未超買）
+            and rsi < rsi_threshold               # RSI 門檻（W型態時可放寬）
             and symbol not in self.positions      # 尚未持倉
         ):
             action = "BUY"
@@ -307,9 +404,11 @@ class FinalAITrader:
         print(
             f"  {emoji} [{symbol}] {action} | "
             f"Price={price:.2f} | RSI={rsi:.1f} | "
-            f"BB={bb_low_val:.2f}~{bb_up:.2f} | FVG={'是' if fvg else '否'}"
+            f"BB={bb_low_val:.2f}~{bb_up:.2f} | FVG={'是' if fvg else '否'} | "
+            f"W={'✅' if w_pattern else '❌'} | 支撐反彈={'✅' if support_bounce else '❌'}"
         )
         print(f"     └ 過馬路: {crossroad_reason}")
+        print(f"     └ W型態: {w_reason}")
 
         # ── 執行下單 ──────────────────────────────────────
         if action == "BUY":
