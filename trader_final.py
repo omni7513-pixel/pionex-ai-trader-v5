@@ -127,6 +127,8 @@ class FinalAITrader:
         self.session        = None
         # 持倉追蹤：{symbol: {"entry_price": float, "qty": float, "side": "BUY"}}
         self.positions      = {}
+        # 餘額快取：update_equity 時更新，get_free_usdt/get_free_coin 直接讀取
+        self._balances: dict = {}
 
     def _load_config(self) -> dict:
         default = {
@@ -181,6 +183,8 @@ class FinalAITrader:
     async def update_equity(self) -> float:
         res = await self._request("GET", "/api/v1/account/balances")
         if res and res.get("result"):
+            # 同時更新餘額快取，供 get_free_usdt/get_free_coin 使用（避免重複請求）
+            self._balances = {b["coin"]: b for b in res["data"]["balances"]}
             usdt = sum(
                 float(b["free"]) + float(b["frozen"])
                 for b in res["data"]["balances"]
@@ -194,6 +198,9 @@ class FinalAITrader:
 
     # ── 獲取可用 USDT 餘額 ────────────────────────────────
     async def get_free_usdt(self) -> float:
+        # 優先讀快取（update_equity 已取得），避免重複 API 請求
+        if "USDT" in self._balances:
+            return float(self._balances["USDT"].get("free", 0))
         res = await self._request("GET", "/api/v1/account/balances")
         if res and res.get("result"):
             for b in res["data"]["balances"]:
@@ -203,6 +210,9 @@ class FinalAITrader:
 
     # ── 獲取幣種可用餘額 ──────────────────────────────────
     async def get_free_coin(self, coin: str) -> float:
+        # 優先讀快取（update_equity 已取得），避免重複 API 請求
+        if coin in self._balances:
+            return float(self._balances[coin].get("free", 0))
         res = await self._request("GET", "/api/v1/account/balances")
         if res and res.get("result"):
             for b in res["data"]["balances"]:
@@ -361,6 +371,9 @@ class FinalAITrader:
             print(f"  ⚠️ [{symbol}] RSI=nan，K線數據不足，跳過")
             return
         bb_up, bb_mid, bb_low_val = calc_bb(df["close"], 20, self.config["bb_std"])
+        # NaN 防護：數據不足時 BB 可能為 NaN，用價格 ±1% 替代
+        if np.isnan(bb_up):
+            bb_up, bb_mid, bb_low_val = price * 1.01, price, price * 0.99
         fvg    = self._detect_fvg(df)
         # W 型態偵測（影片三：合約槓桿做多策略）
         w_pattern, w_reason = self._detect_w_pattern(df)
@@ -455,10 +468,15 @@ class FinalAITrader:
         recent_buys = [h for h in history[-10:] if h["action"] == "BUY"]
         if recent_buys:
             avg_rsi = np.mean([h["rsi"] for h in recent_buys])
-            if avg_rsi > 30:
-                old = self.config["rsi_buy"]
-                self.config["rsi_buy"] = max(15, old - 2)
-                print(f"  🧠 自主學習：RSI 買入閾值 {old} → {self.config['rsi_buy']}")
+            old = self.config["rsi_buy"]
+            # RSI 平均偏高（>50）→ 進場太晚，提高門檻讓條件更嚴格
+            if avg_rsi > 50:
+                self.config["rsi_buy"] = min(65, old + 2)
+            # RSI 平均偏低（<30）→ 進場時機好，可放寬門檻
+            elif avg_rsi < 30:
+                self.config["rsi_buy"] = max(35, old - 2)
+            if self.config["rsi_buy"] != old:
+                print(f"  🧠 自主學習：RSI 買入閾值 {old} → {self.config['rsi_buy']} (avg_rsi={avg_rsi:.1f})")
                 self._save_config()
 
     # ── 主迴圈 ────────────────────────────────────────────
