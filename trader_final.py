@@ -8,8 +8,8 @@ Pionex AI Trader - 終極整合版 (Final Edition)
 
 Karpathy Explicit Assumptions:
   1. PIONEX_API_KEY / PIONEX_API_SECRET 已設置在環境變數中。
-  2. OPENAI_API_KEY 已設置（用於 AI 局勢分析與 SMC 判斷）。
-  3. 成功標準：系統能並行監控 BTC/ETH/SOL，在「位置+狀態」雙重確認後進場，
+  2. OPENAI_API_KEY 可選（用於 AI 局勢分析）。
+  3. 成功標準：系統能並行監控 6 個幣種，在「過馬路+RSI<50」條件下自動下單，
      並在達成每日 10% 獲利目標時自動鎖定利潤停止交易。
 """
 
@@ -35,8 +35,10 @@ SYMBOLS           = ["BTC_USDT", "ETH_USDT", "SOL_USDT", "ADA_USDT", "BNB_USDT",
 DAILY_TARGET_RATE = 0.10   # 每日 10% 獲利目標
 MAX_DRAWDOWN_RATE = 0.15   # 最大回撤 15% 保護
 POSITION_WEIGHT   = 0.30   # 單筆倉位 30%
+TAKE_PROFIT_RATE  = 0.03   # 停利 +3%
+STOP_LOSS_RATE    = 0.02   # 停損 -2%
 
-# 延遲初始化 OpenAI 客戶端，避免 API Key 為空時崩潰
+# 延遲初始化 OpenAI 客戶端
 client = OpenAI(api_key=OPENAI_KEY) if OPENAI_KEY else None
 
 # ─── 工具函數 ────────────────────────────────────────────
@@ -61,7 +63,6 @@ def calc_ema(series: pd.Series, span: int = 200) -> float:
 # ─── 主交易員 ────────────────────────────────────────────
 class FinalAITrader:
     def __init__(self, config_path: str = None):
-        # 使用環境變數指定的資料目錄，預設為 /data（持久化 Volume）
         data_dir = os.getenv("DATA_DIR", "/data")
         os.makedirs(data_dir, exist_ok=True)
         if config_path is None:
@@ -73,6 +74,8 @@ class FinalAITrader:
         self.target_reached = False
         self.market_score   = 0.0
         self.session        = None
+        # 持倉追蹤：{symbol: {"entry_price": float, "qty": float, "side": "BUY"}}
+        self.positions      = {}
 
     def _load_config(self) -> dict:
         default = {
@@ -82,8 +85,11 @@ class FinalAITrader:
             "learning_history": []
         }
         if os.path.exists(self.config_path):
-            saved = json.load(open(self.config_path))
-            default.update(saved)
+            try:
+                saved = json.load(open(self.config_path))
+                default.update(saved)
+            except Exception:
+                pass
         return default
 
     def _save_config(self):
@@ -91,13 +97,6 @@ class FinalAITrader:
 
     # ── 簽名 ──────────────────────────────────────────────
     def _sign(self, method: str, path: str, params: dict = None, body: dict = None):
-        """
-        Pionex 正確簽名方式（參考官方文檔）：
-        1. timestamp 放入 params 中
-        2. 按 ASCII 升序排序所有 params（含 timestamp）
-        3. 拼接 METHOD + PATH?sorted_params
-        4. HMAC SHA256 簽名
-        """
         ts = str(int(time.time() * 1000))
         p  = dict(params or {})
         p["timestamp"] = ts
@@ -117,7 +116,6 @@ class FinalAITrader:
             "Content-Type":     "application/json"
         }
         try:
-            # 使用已排序含 timestamp 的 query string
             url = f"{BASE_URL}{path}?{sorted_qs}"
             async with self.session.request(
                 method, url,
@@ -143,14 +141,69 @@ class FinalAITrader:
         profit = self.current_equity - self.start_equity
         return profit
 
-    # ── 跨市場情緒掃描 (stock-analysis 整合) ──────────────
+    # ── 獲取可用 USDT 餘額 ────────────────────────────────
+    async def get_free_usdt(self) -> float:
+        res = await self._request("GET", "/api/v1/account/balances")
+        if res and res.get("result"):
+            for b in res["data"]["balances"]:
+                if b["coin"] == "USDT":
+                    return float(b["free"])
+        return 0.0
+
+    # ── 獲取幣種可用餘額 ──────────────────────────────────
+    async def get_free_coin(self, coin: str) -> float:
+        res = await self._request("GET", "/api/v1/account/balances")
+        if res and res.get("result"):
+            for b in res["data"]["balances"]:
+                if b["coin"] == coin:
+                    return float(b["free"])
+        return 0.0
+
+    # ── 下單（真實交易）──────────────────────────────────
+    async def place_order(self, symbol: str, side: str, amount_usdt: float, price: float) -> bool:
+        """
+        side: "BUY" 或 "SELL"
+        amount_usdt: 買入金額（USDT）
+        price: 當前市價（用於計算數量）
+        """
+        coin = symbol.replace("_USDT", "")
+
+        if side == "BUY":
+            # 市價買入：用 USDT 金額下單
+            body = {
+                "symbol": symbol,
+                "side": "BUY",
+                "type": "MARKET",
+                "quoteOrderQty": f"{amount_usdt:.4f}"  # 用 USDT 金額買入
+            }
+        else:
+            # 市價賣出：賣出持有的幣種數量
+            qty = await self.get_free_coin(coin)
+            if qty <= 0:
+                print(f"  ⚠️ [{symbol}] 無持倉可賣出")
+                return False
+            body = {
+                "symbol": symbol,
+                "side": "SELL",
+                "type": "MARKET",
+                "quantity": f"{qty:.6f}"
+            }
+
+        res = await self._request("POST", "/api/v1/order", body=body)
+        if res and res.get("result"):
+            order_id = res.get("data", {}).get("orderId", "unknown")
+            print(f"  ✅ [{symbol}] {side} 下單成功！OrderID: {order_id}")
+            return True
+        else:
+            err = res.get("message", "未知錯誤") if res else "無回應"
+            print(f"  ❌ [{symbol}] {side} 下單失敗：{err}")
+            return False
+
+    # ── 跨市場情緒掃描 ────────────────────────────────────
     async def scan_market_sentiment(self):
         print("  🔍 跨市場情緒掃描 (QQQ / NVDA / COIN)...")
-        # 實際可調用 Yahoo Finance API 獲取真實數據
-        # 此處以 AI 推理模擬
         try:
             if client is None:
-                # OpenAI Key 未設定，使用預設中性情緒分數
                 self.market_score = 0.0
             else:
                 resp = client.chat.completions.create(
@@ -171,37 +224,27 @@ class FinalAITrader:
             self.market_score = 0.0
         print(f"  📊 情緒分數: {self.market_score:+.2f}")
 
-    # ── SMC 過馬路理論過濾 (crypto-trading-expert) ────────
+    # ── SMC 過馬路理論過濾 ────────────────────────────────
     def _crossroad_filter(self, df: pd.DataFrame) -> tuple[bool, str]:
-        """
-        過馬路理論：位置 (Position) + 狀態 (State) 雙重確認
-        只有兩者同時正確才允許進場。
-        """
         close  = df["close"]
         ema200 = calc_ema(close, 200)
         price  = float(close.iloc[-1])
-
-        # 位置判斷：價格在 EMA200 上方 = 多頭結構
         position_ok = price > ema200
-
-        # 狀態判斷：近 5 根 K 棒是否形成更高低點（動能確認）
         recent_lows = df["low"].iloc[-5:]
         state_ok    = float(recent_lows.iloc[-1]) > float(recent_lows.iloc[0])
-
         reason = (
             f"位置={'✅多頭' if position_ok else '❌空頭'} | "
             f"狀態={'✅動能向上' if state_ok else '❌動能向下'}"
         )
         return (position_ok and state_ok), reason
 
-    # ── FVG 偵測 (Fair Value Gap) ─────────────────────────
+    # ── FVG 偵測 ──────────────────────────────────────────
     def _detect_fvg(self, df: pd.DataFrame) -> bool:
-        """偵測最近 3 根 K 棒是否存在 FVG（流動性缺口）"""
         if len(df) < 3:
             return False
         c1_high = float(df["high"].iloc[-3])
         c3_low  = float(df["low"].iloc[-1])
-        return c3_low > c1_high  # 上升 FVG
+        return c3_low > c1_high
 
     # ── 單幣種分析與決策 ──────────────────────────────────
     async def analyze_and_trade(self, symbol: str):
@@ -222,19 +265,35 @@ class FinalAITrader:
 
         price  = float(df["close"].iloc[-1])
         rsi    = calc_rsi(df["close"], 7)
-        bb_up, bb_mid, bb_low = calc_bb(df["close"], 20, self.config["bb_std"])
+        bb_up, bb_mid, bb_low_val = calc_bb(df["close"], 20, self.config["bb_std"])
         fvg    = self._detect_fvg(df)
         crossroad_ok, crossroad_reason = self._crossroad_filter(df)
 
+        # ── 停利/停損檢查（已持倉時）────────────────────
+        if symbol in self.positions:
+            pos = self.positions[symbol]
+            entry = pos["entry_price"]
+            pnl_rate = (price - entry) / entry
+            if pnl_rate >= TAKE_PROFIT_RATE:
+                print(f"  🎯 [{symbol}] 停利觸發！獲利 {pnl_rate*100:.1f}%，賣出")
+                success = await self.place_order(symbol, "SELL", 0, price)
+                if success:
+                    del self.positions[symbol]
+                return
+            elif pnl_rate <= -STOP_LOSS_RATE:
+                print(f"  🛑 [{symbol}] 停損觸發！虧損 {pnl_rate*100:.1f}%，賣出")
+                success = await self.place_order(symbol, "SELL", 0, price)
+                if success:
+                    del self.positions[symbol]
+                return
+
         # ── 決策邏輯 ──────────────────────────────────────
         action = "HOLD"
-        rr_ok  = True  # 盈虧比 1:2 預設通過（實際應計算止損距離）
 
         if (
             crossroad_ok                          # 過馬路理論：位置+狀態雙確認
             and rsi < self.config["rsi_buy"]      # RSI 低於 50（未超買）
-            # 布林下軌條件已移除（1分鐘K線波動太小，下軌幾乎不可能觸及）
-            # 情緒分數限制已移除
+            and symbol not in self.positions      # 尚未持倉
         ):
             action = "BUY"
         elif (
@@ -248,11 +307,29 @@ class FinalAITrader:
         print(
             f"  {emoji} [{symbol}] {action} | "
             f"Price={price:.2f} | RSI={rsi:.1f} | "
-            f"BB={bb_low:.2f}~{bb_up:.2f} | FVG={'是' if fvg else '否'}"
+            f"BB={bb_low_val:.2f}~{bb_up:.2f} | FVG={'是' if fvg else '否'}"
         )
         print(f"     └ 過馬路: {crossroad_reason}")
 
-        # ── 自主學習：記錄決策供後續反思 ──────────────────
+        # ── 執行下單 ──────────────────────────────────────
+        if action == "BUY":
+            free_usdt = await self.get_free_usdt()
+            amount = free_usdt * POSITION_WEIGHT
+            if amount < 1.0:
+                print(f"  ⚠️ [{symbol}] USDT 餘額不足（可用: {free_usdt:.2f}，需要至少 1 USDT）")
+            else:
+                print(f"  💸 [{symbol}] 準備買入 {amount:.2f} USDT...")
+                success = await self.place_order(symbol, "BUY", amount, price)
+                if success:
+                    self.positions[symbol] = {"entry_price": price, "qty": amount / price}
+
+        elif action == "SELL" and symbol in self.positions:
+            print(f"  💸 [{symbol}] 準備賣出持倉...")
+            success = await self.place_order(symbol, "SELL", 0, price)
+            if success:
+                del self.positions[symbol]
+
+        # ── 自主學習：記錄決策 ────────────────────────────
         if action != "HOLD":
             self.config["learning_history"].append({
                 "time":   datetime.now().isoformat(),
@@ -262,16 +339,14 @@ class FinalAITrader:
                 "rsi":    rsi,
                 "score":  self.market_score
             })
-            # 只保留最近 100 筆
             self.config["learning_history"] = self.config["learning_history"][-100:]
             self._save_config()
 
-    # ── 自主學習反思（虧損後調整參數）────────────────────
+    # ── 自主學習反思 ──────────────────────────────────────
     def reflect_and_evolve(self):
         history = self.config.get("learning_history", [])
         if len(history) < 5:
             return
-        # 簡化邏輯：若最近 5 筆 BUY 後 RSI 仍偏高，降低買入閾值
         recent_buys = [h for h in history[-10:] if h["action"] == "BUY"]
         if recent_buys:
             avg_rsi = np.mean([h["rsi"] for h in recent_buys])
@@ -287,6 +362,7 @@ class FinalAITrader:
         print("🚀 Pionex AI Trader - 終極整合版 啟動")
         print(f"   監控幣種: {', '.join(SYMBOLS)}")
         print(f"   每日目標: {DAILY_TARGET_RATE*100:.0f}%")
+        print(f"   停利: +{TAKE_PROFIT_RATE*100:.0f}% | 停損: -{STOP_LOSS_RATE*100:.0f}%")
         print("=" * 60)
 
         cycle = 0
@@ -298,6 +374,8 @@ class FinalAITrader:
             profit = await self.update_equity()
             target = self.start_equity * DAILY_TARGET_RATE
             print(f"  💰 資產: {self.current_equity:.4f} USDT | 今日獲利: {profit:.4f} | 目標: {target:.4f}")
+            if self.positions:
+                print(f"  📦 持倉: {list(self.positions.keys())}")
 
             # 2. 達標鎖定
             if self.start_equity > 0 and profit >= target:
@@ -313,7 +391,7 @@ class FinalAITrader:
             # 4. 跨市場情緒掃描
             await self.scan_market_sentiment()
 
-            # 5. 多幣種並行分析
+            # 5. 多幣種並行分析與交易
             await asyncio.gather(*[self.analyze_and_trade(s) for s in SYMBOLS])
 
             # 6. 自主學習反思
