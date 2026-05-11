@@ -357,6 +357,9 @@ class FinalAITrader:
 
         price  = float(df["close"].iloc[-1])
         rsi    = calc_rsi(df["close"], 7)
+        if np.isnan(rsi):
+            print(f"  ⚠️ [{symbol}] RSI=nan，K線數據不足，跳過")
+            return
         bb_up, bb_mid, bb_low_val = calc_bb(df["close"], 20, self.config["bb_std"])
         fvg    = self._detect_fvg(df)
         # W 型態偵測（影片三：合約槓桿做多策略）
@@ -551,14 +554,22 @@ class FinalAITrader:
         """
         # 取得對應現貨 K 線（合約用現貨價格分析）
         spot_symbol = symbol.replace("_PERP", "")
-        try:
-            df = await self.get_klines(spot_symbol, interval="5m", limit=200)
-        except Exception as e:
-            print(f"  ⚠️ 合約 [{symbol}] 取得K線失敗: {e}")
+        res = await self._request(
+            "GET", "/api/v1/market/klines",
+            params={"symbol": spot_symbol, "interval": "5M", "limit": 250}
+        )
+        if not (res and res.get("result")):
+            print(f"  ⚠️ 合約 [{symbol}] 取得K線失敗")
             return
+        df = pd.DataFrame(res["data"]["klines"])
+        for col in ["close", "high", "low", "open"]:
+            df[col] = pd.to_numeric(df[col])
 
         price  = float(df["close"].iloc[-1])
         rsi    = calc_rsi(df["close"], 7)
+        if np.isnan(rsi):
+            print(f"  ⚠️ 合約 [{symbol}] RSI=nan，K線數據不足，跳過")
+            return
         crossroad_ok, crossroad_reason = self._crossroad_filter(df)
         w_pattern, w_reason = self._detect_w_pattern(df)
         support_bounce = self._check_support_bounce(df)
