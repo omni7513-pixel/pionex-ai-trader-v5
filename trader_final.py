@@ -81,7 +81,7 @@ BASE_URL   = "https://api.pionex.com"
 
 SYMBOLS           = ["BTC_USDT", "ETH_USDT", "SOL_USDT", "ADA_USDT", "BNB_USDT", "XRP_USDT", "NVDAX_USDT"]
 FUTURES_SYMBOLS   = ["BTC_USDT_PERP", "ETH_USDT_PERP", "SOL_USDT_PERP"]  # 合約幣種
-DAILY_TARGET_RATE = 0.10   # 每日 10% 獲利目標
+DAILY_TARGET_USDT = 10.0   # 每日固定 10 USDT 獲利目標（不用百分比）
 MAX_DRAWDOWN_RATE = 0.15   # 最大回撤 15% 保護
 POSITION_WEIGHT   = 0.60   # 現貨單筆倉位 60%（本金 6:4 分配，現貨佔 60%）
 FUTURES_WEIGHT    = 0.40   # 合約資金佔比 40%（本金 6:4 分配，合約佔 40%）
@@ -581,7 +581,13 @@ class FinalAITrader:
                 print(f"  ✅ 合約{side}成功 [{symbol}] size={size:.6f} | OrderID={order_id}")
                 return True
             else:
-                print(f"  ❌ 合約{side}失敗 [{symbol}]: {resp}")
+                code_str = resp.get("code", "")
+                if code_str == "TRADE_TYPE_DENIED":
+                    if not getattr(self, '_futures_whitelist_warned', False):
+                        print("  ⏸️ 合約 API 白名單未開通，跳過合約交易（請聯繫 Pionex 客服開通）")
+                        self._futures_whitelist_warned = True
+                else:
+                    print(f"  ❌ 合約{side}失敗 [{symbol}]: {resp}")
                 return False
         except Exception as e:
             print(f"  ❌ 合約下單異常 [{symbol}]: {e}")
@@ -686,7 +692,7 @@ class FinalAITrader:
         print("🚀 Pionex AI Trader - 終極整合版 啟動")
         print(f"   現貨幣種 (60%): {', '.join(SYMBOLS)}")
         print(f"   合約幣種 (40%): {', '.join(FUTURES_SYMBOLS)} | 最高槓桿: {MAX_LEVERAGE}x")
-        print(f"   每日目標: {DAILY_TARGET_RATE*100:.0f}% | 停利: +{TAKE_PROFIT_RATE*100:.0f}% | 停損: -{STOP_LOSS_RATE*100:.0f}%")
+        print(f"   每日目標: {DAILY_TARGET_USDT:.1f} USDT | 停利: +{TAKE_PROFIT_RATE*100:.0f}% | 停損: -{STOP_LOSS_RATE*100:.0f}%")
         print("=" * 60)
 
         cycle = 0
@@ -696,15 +702,15 @@ class FinalAITrader:
 
             # 1. 更新資產
             profit = await self.update_equity()
-            target = self.start_equity * DAILY_TARGET_RATE
-            print(f"  💰 資產: {self.current_equity:.4f} USDT | 今日獲利: {profit:.4f} | 目標: {target:.4f}")
+            target = DAILY_TARGET_USDT
+            print(f"  💰 資產: {self.current_equity:.4f} USDT | 今日獲利: {profit:.4f} USDT | 目標: +{DAILY_TARGET_USDT:.1f} USDT")
             if self.positions:
                 print(f"  📦 持倉: {list(self.positions.keys())}")
 
             # 2. 達標鎖定
-            if self.start_equity > 0 and profit >= target:
+            if profit >= DAILY_TARGET_USDT:
                 self.target_reached = True
-                print("  🎉 每日 10% 目標達成！鎖定利潤，停止今日交易。")
+                print("  🎉 每日目標達成！今日獲利已達 10 USDT，鎖定利潤，停止今日交易。")
                 break
 
             # 3. 最大回撤保護
