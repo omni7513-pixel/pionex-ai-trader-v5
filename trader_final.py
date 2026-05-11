@@ -134,6 +134,7 @@ class FinalAITrader:
         self.positions      = {}
         # 餘額快取：update_equity 時更新，get_free_usdt/get_free_coin 直接讀取
         self._balances: dict = {}
+        self._usdt_free: float = 0.0  # 純 USDT 可用餘額，供日誌顯示
 
     def _load_config(self) -> dict:
         default = {
@@ -203,9 +204,15 @@ class FinalAITrader:
                 for b in res["data"]["balances"]
                 if b["coin"] == "USDT"
             )
-            self.current_equity = usdt
+            # 計算總資產 = USDT + 所有持倉幣種的 USD 折算值
+            total = sum(
+                float(b.get("coinUSDValue", 0))
+                for b in res["data"]["balances"]
+            )
+            self.current_equity = total if total > 0 else usdt
+            self._usdt_free = usdt  # 記錄純 USDT 餘額供日誌顯示
             if self.start_equity == 0:
-                self.start_equity = usdt
+                self.start_equity = self.current_equity
             # ── 從帳戶餘額同步持倉（防止重啟後 positions 清空導致重複買入）──
             # 只同步 SYMBOLS 中的幣種，避免誤算網格機器人持倉
             for sym in SYMBOLS:
@@ -722,9 +729,17 @@ class FinalAITrader:
             # 1. 更新資產
             profit = await self.update_equity()
             target = DAILY_TARGET_USDT
-            print(f"  💰 資產: {self.current_equity:.4f} USDT | 今日獲利: {profit:.4f} USDT | 目標: +{DAILY_TARGET_USDT:.1f} USDT")
+            usdt_free = getattr(self, "_usdt_free", self.current_equity)
+            print(f"  💰 總資產: {self.current_equity:.2f} USDT | 可用: {usdt_free:.2f} USDT | 今日獲利: {profit:.4f} USDT | 目標: +{DAILY_TARGET_USDT:.1f} USDT")
             if self.positions:
-                print(f"  📦 持倉: {list(self.positions.keys())}")
+                pos_details = []
+                for sym, pos in self.positions.items():
+                    coin = sym.replace("_USDT", "")
+                    bal = self._balances.get(coin, {})
+                    qty = float(bal.get("free", 0)) + float(bal.get("frozen", 0))
+                    usd_val = float(bal.get("coinUSDValue", 0))
+                    pos_details.append(f"{coin}: {qty:.6f} (≈{usd_val:.2f}U)")
+                print(f"  📦 持倉: {' | '.join(pos_details)}")
 
             # 2. 達標鎖定
             if profit >= DAILY_TARGET_USDT:
