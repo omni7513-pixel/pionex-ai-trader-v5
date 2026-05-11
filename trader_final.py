@@ -158,16 +158,22 @@ class FinalAITrader:
         ts = str(int(time.time() * 1000))
         p  = dict(params or {})
         p["timestamp"] = ts
+        # POST 簽名：body 欄位也要加入 query string 一起排序
+        if body:
+            for k, v in body.items():
+                p[k] = v
         sorted_qs = "&".join(f"{k}={v}" for k, v in sorted(p.items()))
-        sign_str  = f"{method.upper()}{path}?{sorted_qs}"
+        # 簽名字串：METHOD + PATH?sorted_qs + body_json（compact）
+        body_json_str = json.dumps(body, separators=(',', ':')) if body else ""
+        sign_str  = f"{method.upper()}{path}?{sorted_qs}{body_json_str}"
         sig = hmac.new(API_SECRET.encode("utf-8"), sign_str.encode("utf-8"), hashlib.sha256).hexdigest()
-        return sorted_qs, sig
+        return sorted_qs, sig, body_json_str
 
     # ── HTTP 請求 ─────────────────────────────────────────
     async def _request(self, method: str, path: str, params: dict = None, body: dict = None):
         if not self.session:
             self.session = aiohttp.ClientSession()
-        sorted_qs, sig = self._sign(method, path, params, body)
+        sorted_qs, sig, body_json_str = self._sign(method, path, params, body)
         headers = {
             "PIONEX-KEY":       API_KEY,
             "PIONEX-SIGNATURE": sig,
@@ -175,9 +181,11 @@ class FinalAITrader:
         }
         try:
             url = f"{BASE_URL}{path}?{sorted_qs}"
+            # 使用 data= 而非 json=，確保 body 字串與簽名時完全一致
+            data = body_json_str.encode("utf-8") if body_json_str else None
             async with self.session.request(
                 method, url,
-                json=body, headers=headers, timeout=aiohttp.ClientTimeout(total=10)
+                data=data, headers=headers, timeout=aiohttp.ClientTimeout(total=10)
             ) as resp:
                 return await resp.json(content_type=None)
         except Exception as e:
@@ -235,12 +243,16 @@ class FinalAITrader:
         coin = symbol.replace("_USDT", "")
 
         if side == "BUY":
-            # 市價買入：用 USDT 金額下單
+            # 市價買入：amount = USDT 金額（Pionex MARKET BUY 的 amount 欄位是 USDT 金額）
+            # 最小下單金額：10 USDT
+            if amount_usdt < 10.0:
+                print(f"  ⚠️ [{symbol}] 買入金額 {amount_usdt:.2f} USDT 低於最小 10 USDT，跳過")
+                return False
             body = {
                 "symbol": symbol,
                 "side": "BUY",
                 "type": "MARKET",
-                "quoteOrderQty": f"{amount_usdt:.4f}"  # 用 USDT 金額買入
+                "amount": f"{amount_usdt:.2f}"
             }
         else:
             # 市價賣出：賣出持有的幣種數量
@@ -252,7 +264,7 @@ class FinalAITrader:
                 "symbol": symbol,
                 "side": "SELL",
                 "type": "MARKET",
-                "quantity": f"{qty:.6f}"
+                "size": f"{qty:.6f}"  # SELL 用 size（幣種數量）
             }
 
         res = await self._request("POST", "/api/v1/trade/order", body=body)
@@ -445,7 +457,7 @@ class FinalAITrader:
         if action == "BUY":
             free_usdt = await self.get_free_usdt()
             amount = free_usdt * POSITION_WEIGHT
-            if amount < 1.0:
+            if amount < 10.0:  # Pionex 最小下單金額 10 USDT
                 print(f"  ⚠️ [{symbol}] USDT 餘額不足（可用: {free_usdt:.2f}，需要至少 1 USDT）")
             else:
                 print(f"  💸 [{symbol}] 準備買入 {amount:.2f} USDT...")
