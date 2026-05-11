@@ -97,6 +97,11 @@ def calc_rsi(series: pd.Series, period: int = 7) -> float:
     delta = series.diff()
     gain  = delta.where(delta > 0, 0.0).rolling(period).mean()
     loss  = -delta.where(delta < 0, 0.0).rolling(period).mean()
+    # 美股休市時 close 全部相同，gain=loss=0 → NaN；改為回傳 50（中性）
+    last_gain = float(gain.iloc[-1])
+    last_loss = float(loss.iloc[-1])
+    if last_gain == 0 and last_loss == 0:
+        return 50.0
     rs    = gain / loss.replace(0, np.nan)
     rsi   = 100 - (100 / (1 + rs))
     return float(rsi.iloc[-1])
@@ -250,13 +255,16 @@ class FinalAITrader:
                 "quantity": f"{qty:.6f}"
             }
 
-        res = await self._request("POST", "/api/v1/order", body=body)
+        res = await self._request("POST", "/api/v1/trade/order", body=body)
         if res and res.get("result"):
             order_id = res.get("data", {}).get("orderId", "unknown")
             print(f"  ✅ [{symbol}] {side} 下單成功！OrderID: {order_id}")
             return True
         else:
-            err = res.get("message", "未知錯誤") if res else "無回應"
+            if res:
+                err = res.get("message") or res.get("code") or str(res)
+            else:
+                err = "無回應（網路錯誤或超時）"
             print(f"  ❌ [{symbol}] {side} 下單失敗：{err}")
             return False
 
@@ -369,6 +377,10 @@ class FinalAITrader:
         rsi    = calc_rsi(df["close"], 7)
         if np.isnan(rsi):
             print(f"  ⚠️ [{symbol}] RSI=nan，K線數據不足，跳過")
+            return
+        # 美股休市偵測：最後 5 筆 close 完全相同 → 市場凍結，跳過
+        if df["close"].iloc[-5:].nunique() == 1:
+            print(f"  ⏸️ [{symbol}] 美股休市（價格凍結），跳過本輪")
             return
         bb_up, bb_mid, bb_low_val = calc_bb(df["close"], 20, self.config["bb_std"])
         # NaN 防護：數據不足時 BB 可能為 NaN，用價格 ±1% 替代
