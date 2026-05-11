@@ -34,7 +34,7 @@ BASE_URL   = "https://api.pionex.com"
 SYMBOLS           = ["BTC_USDT", "ETH_USDT", "SOL_USDT", "ADA_USDT", "BNB_USDT", "XRP_USDT"]
 DAILY_TARGET_RATE = 0.10   # 每日 10% 獲利目標
 MAX_DRAWDOWN_RATE = 0.15   # 最大回撤 15% 保護
-POSITION_WEIGHT   = 0.30   # 單筆倉位 30%
+POSITION_WEIGHT   = 0.50   # 單筆倉位 50%
 TAKE_PROFIT_RATE  = 0.03   # 停利 +3%
 STOP_LOSS_RATE    = 0.02   # 停損 -2%
 
