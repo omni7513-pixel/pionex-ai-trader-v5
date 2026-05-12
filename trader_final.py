@@ -134,7 +134,9 @@ class FinalAITrader:
         self.positions      = {}
         # 餘額快取：update_equity 時更新，get_free_usdt/get_free_coin 直接讀取
         self._balances: dict = {}
-        self._usdt_free: float = 0.0  # 純 USDT 可用餘額，供日誌顯示
+        self._usdt_free: float = 0.0   # 純 USDT 可用餘額，供日誌顯示
+        self._bot_equity: float = 0.0  # 機器人佔用資金（USDT 折算）
+        self._bot_details: list = []   # 機器人詳情列表
 
     def _load_config(self) -> dict:
         default = {
@@ -193,24 +195,78 @@ class FinalAITrader:
             print(f"  ⚠️ 請求錯誤 [{path}]: {e}")
             return None
 
+    # ── 查詢機器人佔用資金 ────────────────────────────────────
+    async def _fetch_bot_equity(self) -> float:
+        """查詢所有運行中機器人的佔用資金，回傳 USDT 總額與詳情列表"""
+        res = await self._request("GET", "/api/v1/bot/orders", params={"page": "0", "pageSize": "20"})
+        total_bot_usdt = 0.0
+        details = []
+        if res and res.get("result"):
+            for bot in res.get("data", {}).get("results", []):
+                bot_type = bot.get("buOrderType", "")
+                base     = bot.get("base", "?")
+                quote    = bot.get("quote", "USDT")
+                data     = bot.get("buOrderData", {})
+                # 取得機器人實際佔用的 USDT（優先用 marginBalance，其次 usdtInvestment）
+                margin = data.get("marginBalance")
+                invest = data.get("usdtInvestment") or data.get("initUsdtInvestment", "0")
+                usdt_val = float(margin) if margin is not None else float(invest or 0)
+                total_bot_usdt += usdt_val
+                # 機器人類型標籤
+                type_label = {
+                    "futures_grid": "合約網格",
+                    "spot_grid":    "現貨網格",
+                }.get(bot_type, bot_type)
+                details.append(f"{type_label}({base}/{quote}): {usdt_val:.2f}U")
+        self._bot_equity  = total_bot_usdt
+        self._bot_details = details
+        return total_bot_usdt
+
     # ── 帳戶資產 ──────────────────────────────────────────
     async def update_equity(self) -> float:
         res = await self._request("GET", "/api/v1/account/balances")
         if res and res.get("result"):
             # 同時更新餘額快取，供 get_free_usdt/get_free_coin 使用（避免重複請求）
             self._balances = {b["coin"]: b for b in res["data"]["balances"]}
-            usdt = sum(
+            # 可用 USDT（現貨帳戶中未被機器人鎖定的部分）
+            usdt_free = sum(
+                float(b["free"])
+                for b in res["data"]["balances"]
+                if b["coin"] == "USDT"
+            )
+            usdt_total = sum(
                 float(b["free"]) + float(b["frozen"])
                 for b in res["data"]["balances"]
                 if b["coin"] == "USDT"
             )
-            # 計算總資產 = USDT + 所有持倉幣種的 USD 折算值
-            total = sum(
-                float(b.get("coinUSDValue", 0))
-                for b in res["data"]["balances"]
-            )
-            self.current_equity = total if total > 0 else usdt
-            self._usdt_free = usdt  # 記錄純 USDT 餘額供日誌顯示
+            # 現貨持倉市值（非 USDT 幣種，用即時價格折算）
+            spot_holding_usdt = 0.0
+            for b in res["data"]["balances"]:
+                if b["coin"] == "USDT":
+                    continue
+                qty = float(b.get("free", 0)) + float(b.get("frozen", 0))
+                if qty <= 0:
+                    continue
+                # 嘗試用 coinUSDValue，若為 0 則查即時價格
+                usd_val = float(b.get("coinUSDValue", 0))
+                if usd_val <= 0:
+                    coin = b["coin"]
+                    ticker = await self._request("GET", "/api/v1/market/tickers",
+                                                 params={"symbol": f"{coin}_USDT"})
+                    if ticker and ticker.get("result"):
+                        tickers = ticker.get("data", {}).get("tickers", [])
+                        if tickers:
+                            price = float(tickers[0].get("close", 0))
+                            usd_val = qty * price
+                            # 把計算好的 USD 值存回快取，供日誌顯示
+                            if coin in self._balances:
+                                self._balances[coin]["coinUSDValue"] = usd_val
+                spot_holding_usdt += usd_val
+            # 查詢機器人佔用資金
+            bot_usdt = await self._fetch_bot_equity()
+            # 總資產 = 可用 USDT + 現貨持倉市值 + 機器人佔用資金
+            self.current_equity = usdt_total + spot_holding_usdt + bot_usdt
+            self._usdt_free = usdt_free  # 記錄純可用 USDT 供日誌顯示
             if self.start_equity == 0:
                 self.start_equity = self.current_equity
             # ── 從帳戶餘額同步持倉（防止重啟後 positions 清空導致重複買入）──
@@ -731,15 +787,23 @@ class FinalAITrader:
             target = DAILY_TARGET_USDT
             usdt_free = getattr(self, "_usdt_free", self.current_equity)
             print(f"  💰 總資產: {self.current_equity:.2f} USDT | 可用: {usdt_free:.2f} USDT | 今日獲利: {profit:.4f} USDT | 目標: +{DAILY_TARGET_USDT:.1f} USDT")
+            # 顯示機器人資訊
+            if getattr(self, "_bot_details", []):
+                print(f"  🤖 機器人: {' | '.join(self._bot_details)} (共 {self._bot_equity:.2f} USDT)")
+            # 顯示現貨持倉（用即時價格折算 USD 值）
             if self.positions:
                 pos_details = []
                 for sym, pos in self.positions.items():
                     coin = sym.replace("_USDT", "")
                     bal = self._balances.get(coin, {})
                     qty = float(bal.get("free", 0)) + float(bal.get("frozen", 0))
+                    # coinUSDValue 已在 update_equity 中用即時價格填入
                     usd_val = float(bal.get("coinUSDValue", 0))
-                    pos_details.append(f"{coin}: {qty:.6f} (≈{usd_val:.2f}U)")
-                print(f"  📦 持倉: {' | '.join(pos_details)}")
+                    if usd_val > 0:
+                        pos_details.append(f"{coin}: {qty:.6f} (≈{usd_val:.2f}U)")
+                    else:
+                        pos_details.append(f"{coin}: {qty:.6f}")
+                print(f"  📦 現貨持倉: {' | '.join(pos_details)}")
 
             # 2. 達標鎖定
             if profit >= DAILY_TARGET_USDT:
